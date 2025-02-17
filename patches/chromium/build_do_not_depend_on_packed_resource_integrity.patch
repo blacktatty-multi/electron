@@ -11,33 +11,33 @@ if we ever align our .pak file generation with Chrome we can remove this
 patch.
 
 diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
-index 3ea31014540b5679880a00e1a3ae8674b8858348..d8b18d03446b6aecad22ab778f6b512ced7fb1cb 100644
+index 1da9a118fedc612dfed638abba54e69b983d9185..f76f04f25307c9d49edf7462c16e0e04f64109aa 100644
 --- a/chrome/BUILD.gn
 +++ b/chrome/BUILD.gn
-@@ -200,11 +200,16 @@ if (!is_android && !is_mac) {
-           "common/crash_keys.h",
-         ]
+@@ -196,11 +196,16 @@ if (!is_android && !is_mac) {
+         "common/crash_keys.h",
+       ]
  
-+        if (!is_electron_build) {
-+          deps = [
-+            ":packed_resources_integrity_header",
-+          ]
-+        }
++      if (!is_electron_build) {
++        deps = [
++          ":packed_resources_integrity_header",
++        ]
++      }
 +
-         deps += [
-           ":chrome_dll",
-           ":chrome_exe_version",
-           ":copy_first_run",
--          ":packed_resources_integrity_header",
-           ":visual_elements_resources",
-           "//base",
-           "//build:branding_buildflags",
+       deps += [
+         ":chrome_dll",
+         ":chrome_exe_version",
+         ":copy_first_run",
+-        ":packed_resources_integrity_header",
+         ":visual_elements_resources",
+         "//base",
+         "//build:branding_buildflags",
 diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
-index 0e22dc99e59133363b5d56dc6fba9f603a6d9c67..59162df964cf90225010591a722ed8bd0e8269c6 100644
+index 9f293f4ddd146e183e50ad3a99f464c10d2aaab5..9de2b989244cdf2966004b40118ea1b13d3be7b0 100644
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
-@@ -4516,7 +4516,7 @@ static_library("browser") {
-       ]
+@@ -4527,7 +4527,7 @@ static_library("browser") {
+           [ "//chrome/browser/ui/webui/signin:profile_impl" ]
      }
  
 -    if (!is_win) {
@@ -46,10 +46,10 @@ index 0e22dc99e59133363b5d56dc6fba9f603a6d9c67..59162df964cf90225010591a722ed8bd
        # than here in :chrome_dll.
        deps += [ "//chrome:packed_resources_integrity_header" ]
 diff --git a/chrome/test/BUILD.gn b/chrome/test/BUILD.gn
-index 50bbabb107314333070aabaf78ca79e5f8fa801f..4e2255f209d6523359cb626f361742e70285b2ae 100644
+index c3394f059fa284ebcfd3597951343b2e375c72f3..65576f0ba3335f8ede68037bf1a490f64ea495d7 100644
 --- a/chrome/test/BUILD.gn
 +++ b/chrome/test/BUILD.gn
-@@ -6887,9 +6887,12 @@ test("unit_tests") {
+@@ -7000,9 +7000,12 @@ test("unit_tests") {
        "//chrome/notification_helper",
      ]
  
@@ -63,7 +63,7 @@ index 50bbabb107314333070aabaf78ca79e5f8fa801f..4e2255f209d6523359cb626f361742e7
        "//chrome//services/util_win:unit_tests",
        "//chrome/app:chrome_dll_resources",
        "//chrome/app:win_unit_tests",
-@@ -7823,6 +7826,10 @@ test("unit_tests") {
+@@ -7960,6 +7963,10 @@ test("unit_tests") {
        "../browser/performance_manager/policies/background_tab_loading_policy_unittest.cc",
      ]
  
@@ -74,7 +74,7 @@ index 50bbabb107314333070aabaf78ca79e5f8fa801f..4e2255f209d6523359cb626f361742e7
      sources += [
        # The importer code is not used on Android.
        "../common/importer/firefox_importer_utils_unittest.cc",
-@@ -7875,7 +7882,6 @@ test("unit_tests") {
+@@ -8020,7 +8027,6 @@ test("unit_tests") {
      # Non-android deps for "unit_tests" target.
      deps += [
        "../browser/screen_ai:screen_ai_install_state",

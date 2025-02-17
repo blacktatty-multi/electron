@@ -31,7 +31,6 @@
 #include "content/public/browser/web_contents_delegate.h"
 #include "content/public/browser/web_contents_observer.h"
 #include "electron/buildflags/buildflags.h"
-#include "electron/shell/common/api/api.mojom.h"
 #include "gin/handle.h"
 #include "gin/wrappable.h"
 #include "printing/buildflags/buildflags.h"
@@ -40,11 +39,14 @@
 #include "shell/browser/event_emitter_mixin.h"
 #include "shell/browser/extended_web_contents_observer.h"
 #include "shell/browser/osr/osr_paint_event.h"
+#include "shell/browser/preload_script.h"
 #include "shell/browser/ui/inspectable_web_contents_delegate.h"
 #include "shell/browser/ui/inspectable_web_contents_view_delegate.h"
+#include "shell/common/api/api.mojom.h"
 #include "shell/common/gin_helper/cleaned_up_at_exit.h"
 #include "shell/common/gin_helper/constructible.h"
 #include "shell/common/gin_helper/pinnable.h"
+#include "shell/common/web_contents_utility.mojom.h"
 #include "ui/base/models/image_model.h"
 
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
@@ -53,6 +55,10 @@
 namespace extensions {
 class ScriptExecutor;
 }
+#endif
+
+#if BUILDFLAG(IS_WIN) && BUILDFLAG(ENABLE_BUILTIN_SPELLCHECKER)
+#include "components/spellcheck/common/spellcheck_common.h"
 #endif
 
 namespace blink {
@@ -175,6 +181,9 @@ class WebContents final : public ExclusiveAccessContext,
   static gin::WrapperInfo kWrapperInfo;
   const char* GetTypeName() override;
 
+  // gin_helper::CleanedUpAtExit
+  void WillBeDestroyed() override;
+
   void Destroy();
   void Close(std::optional<gin_helper::Dictionary> options);
   base::WeakPtr<WebContents> GetWeakPtr() { return weak_factory_.GetWeakPtr(); }
@@ -183,7 +192,7 @@ class WebContents final : public ExclusiveAccessContext,
   bool GetBackgroundThrottling() const override;
 
   void SetBackgroundThrottling(bool allowed);
-  int GetProcessID() const;
+  int32_t GetProcessID() const;
   base::ProcessId GetOSProcessID() const;
   [[nodiscard]] Type type() const { return type_; }
   bool Equal(const WebContents* web_contents) const;
@@ -210,6 +219,10 @@ class WebContents final : public ExclusiveAccessContext,
   bool RemoveNavigationEntryAtIndex(int index);
   std::vector<content::NavigationEntry*> GetHistory() const;
   void ClearHistory();
+  void RestoreHistory(v8::Isolate* isolate,
+                      gin_helper::ErrorThrower thrower,
+                      int index,
+                      const std::vector<v8::Local<v8::Value>>& entries);
   int GetHistoryLength() const;
   const std::string GetWebRTCIPHandlingPolicy() const;
   void SetWebRTCIPHandlingPolicy(const std::string& webrtc_ip_handling_policy);
@@ -337,8 +350,8 @@ class WebContents final : public ExclusiveAccessContext,
                       const std::string& features,
                       const scoped_refptr<network::ResourceRequestBody>& body);
 
-  // Returns the preload script path of current WebContents.
-  std::vector<base::FilePath> GetPreloadPaths() const;
+  // Returns the preload script of current WebContents.
+  std::optional<PreloadScript> GetPreloadScript() const;
 
   // Returns the web preferences of current WebContents.
   v8::Local<v8::Value> GetLastWebPreferences(v8::Isolate* isolate) const;
@@ -461,9 +474,6 @@ class WebContents final : public ExclusiveAccessContext,
   // mojom::ElectronWebContentsUtility
   void OnFirstNonEmptyLayout(content::RenderFrameHost* render_frame_host);
   void SetTemporaryZoomLevel(double level);
-  void DoGetZoomLevel(
-      electron::mojom::ElectronWebContentsUtility::DoGetZoomLevelCallback
-          callback);
 
   void SetImageAnimationPolicy(const std::string& new_policy);
 
@@ -603,6 +613,8 @@ class WebContents final : public ExclusiveAccessContext,
                           bool user_gesture,
                           bool last_unlocked_by_target) override;
   void LostPointerLock() override;
+  bool IsWaitingForPointerLockPrompt(
+      content::WebContents* web_contents) override;
   void OnRequestKeyboardLock(content::WebContents* web_contents,
                              bool esc_key_locked,
                              bool allowed);
@@ -794,6 +806,14 @@ class WebContents final : public ExclusiveAccessContext,
   void SetHtmlApiFullscreen(bool enter_fullscreen);
   // Update the html fullscreen flag in both browser and renderer.
   void UpdateHtmlApiFullscreen(bool fullscreen);
+
+#if BUILDFLAG(IS_WIN) && BUILDFLAG(ENABLE_BUILTIN_SPELLCHECKER)
+  void OnGetPlatformSuggestionsComplete(
+      content::RenderFrameHost& render_frame_host,
+      const content::ContextMenuParams& params,
+      const spellcheck::PerLanguageSuggestions&
+          platform_per_language_suggestions);
+#endif
 
   v8::Global<v8::Value> session_;
   v8::Global<v8::Value> devtools_web_contents_;

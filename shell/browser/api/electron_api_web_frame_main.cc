@@ -17,13 +17,13 @@
 #include "content/public/browser/frame_tree_node_id.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/common/isolated_world_ids.h"
-#include "electron/shell/common/api/api.mojom.h"
 #include "gin/handle.h"
 #include "gin/object_template_builder.h"
 #include "services/service_manager/public/cpp/interface_provider.h"
 #include "shell/browser/api/message_port.h"
 #include "shell/browser/browser.h"
 #include "shell/browser/javascript_environment.h"
+#include "shell/common/api/api.mojom.h"
 #include "shell/common/gin_converters/blink_converter.h"
 #include "shell/common/gin_converters/frame_converter.h"
 #include "shell/common/gin_converters/gurl_converter.h"
@@ -93,9 +93,8 @@ namespace electron::api {
 // FrameTreeNodeId -> WebFrameMain*
 // Using FrameTreeNode allows us to track frame across navigations. This
 // is most similar to how <iframe> works.
-using FrameTreeNodeIdMap = std::unordered_map<content::FrameTreeNodeId,
-                                              WebFrameMain*,
-                                              content::FrameTreeNodeId::Hasher>;
+using FrameTreeNodeIdMap =
+    std::unordered_map<content::FrameTreeNodeId, WebFrameMain*>;
 
 // Token -> WebFrameMain*
 // Maps exact RFH to a WebFrameMain instance.
@@ -184,7 +183,7 @@ void WebFrameMain::UpdateRenderFrameHost(content::RenderFrameHost* rfh) {
 }
 
 bool WebFrameMain::CheckRenderFrame() const {
-  if (render_frame_disposed_) {
+  if (!HasRenderFrame()) {
     v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
     v8::HandleScope scope(isolate);
     gin_helper::ErrorThrower(isolate).ThrowError(
@@ -362,10 +361,10 @@ base::ProcessId WebFrameMain::OSProcessID() const {
   return base::GetProcId(process_handle);
 }
 
-int WebFrameMain::ProcessID() const {
+int32_t WebFrameMain::ProcessID() const {
   if (!CheckRenderFrame())
     return -1;
-  return render_frame_->GetProcess()->GetID();
+  return render_frame_->GetProcess()->GetID().GetUnsafeValue();
 }
 
 int WebFrameMain::RoutingID() const {
@@ -376,7 +375,7 @@ int WebFrameMain::RoutingID() const {
 
 GURL WebFrameMain::URL() const {
   if (!CheckRenderFrame())
-    return GURL::EmptyGURL();
+    return {};
   return render_frame_->GetLastCommittedURL();
 }
 
@@ -436,7 +435,7 @@ v8::Local<v8::Promise> WebFrameMain::CollectDocumentJSCallStack(
   gin_helper::Promise<base::Value> promise(args->isolate());
   v8::Local<v8::Promise> handle = promise.GetHandle();
 
-  if (render_frame_disposed_) {
+  if (!HasRenderFrame()) {
     promise.RejectWithErrorMessage(
         "Render frame was disposed before WebFrameMain could be accessed");
     return handle;
@@ -464,7 +463,7 @@ void WebFrameMain::CollectedJavaScriptCallStack(
     gin_helper::Promise<base::Value> promise,
     const std::string& untrusted_javascript_call_stack,
     const std::optional<blink::LocalFrameToken>& remote_frame_token) {
-  if (render_frame_disposed_) {
+  if (!HasRenderFrame()) {
     promise.RejectWithErrorMessage(
         "Render frame was disposed before call stack was received");
     return;

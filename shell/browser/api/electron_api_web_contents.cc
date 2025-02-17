@@ -54,6 +54,7 @@
 #include "content/public/browser/keyboard_event_processing_result.h"
 #include "content/public/browser/navigation_details.h"
 #include "content/public/browser/navigation_entry.h"
+#include "content/public/browser/navigation_entry_restore_context.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/render_process_host.h"
@@ -70,7 +71,6 @@
 #include "content/public/common/webplugininfo.h"
 #include "electron/buildflags/buildflags.h"
 #include "electron/mas.h"
-#include "electron/shell/common/api/api.mojom.h"
 #include "gin/arguments.h"
 #include "gin/data_object_builder.h"
 #include "gin/handle.h"
@@ -110,6 +110,7 @@
 #include "shell/browser/web_contents_zoom_controller.h"
 #include "shell/browser/web_view_guest_delegate.h"
 #include "shell/browser/web_view_manager.h"
+#include "shell/common/api/api.mojom.h"
 #include "shell/common/api/electron_api_native_image.h"
 #include "shell/common/api/electron_bindings.h"
 #include "shell/common/color_util.h"
@@ -132,6 +133,7 @@
 #include "shell/common/gin_helper/locker.h"
 #include "shell/common/gin_helper/object_template_builder.h"
 #include "shell/common/gin_helper/promise.h"
+#include "shell/common/gin_helper/reply_channel.h"
 #include "shell/common/language_util.h"
 #include "shell/common/node_includes.h"
 #include "shell/common/node_util.h"
@@ -143,6 +145,7 @@
 #include "third_party/blink/public/common/input/web_input_event.h"
 #include "third_party/blink/public/common/messaging/transferable_message_mojom_traits.h"
 #include "third_party/blink/public/common/page/page_zoom.h"
+#include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
 #include "third_party/blink/public/mojom/frame/find_in_page.mojom.h"
 #include "third_party/blink/public/mojom/frame/fullscreen.mojom.h"
 #include "third_party/blink/public/mojom/messaging/transferable_message.mojom.h"
@@ -189,6 +192,14 @@
 
 #if BUILDFLAG(ENABLE_PLUGINS)
 #include "content/public/browser/plugin_service.h"
+#endif
+
+#if BUILDFLAG(IS_WIN) && BUILDFLAG(ENABLE_BUILTIN_SPELLCHECKER)
+#include "chrome/browser/spellchecker/spellcheck_factory.h"
+#include "chrome/browser/spellchecker/spellcheck_service.h"
+#include "components/spellcheck/browser/spellcheck_platform.h"
+#include "components/spellcheck/common/spellcheck_common.h"
+#include "components/spellcheck/common/spellcheck_features.h"
 #endif
 
 #if !IS_MAS_BUILD()
@@ -353,14 +364,60 @@ struct Converter<scoped_refptr<content::DevToolsAgentHost>> {
 
 template <>
 struct Converter<content::NavigationEntry*> {
+  static bool FromV8(v8::Isolate* isolate,
+                     v8::Local<v8::Value> val,
+                     content::NavigationEntry** out) {
+    gin_helper::Dictionary dict;
+    if (!gin::ConvertFromV8(isolate, val, &dict))
+      return false;
+
+    std::string url_str;
+    std::string title;
+    std::string encoded_page_state;
+    GURL url;
+
+    if (!dict.Get("url", &url) || !dict.Get("title", &title))
+      return false;
+
+    auto entry = content::NavigationEntry::Create();
+    entry->SetURL(url);
+    entry->SetTitle(base::UTF8ToUTF16(title));
+
+    // Handle optional page state
+    if (dict.Get("pageState", &encoded_page_state)) {
+      std::string decoded_page_state;
+      if (base::Base64Decode(encoded_page_state, &decoded_page_state)) {
+        auto restore_context = content::NavigationEntryRestoreContext::Create();
+
+        auto page_state =
+            blink::PageState::CreateFromEncodedData(decoded_page_state);
+        if (!page_state.IsValid())
+          return false;
+
+        entry->SetPageState(std::move(page_state), restore_context.get());
+      }
+    }
+
+    *out = entry.release();
+    return true;
+  }
+
   static v8::Local<v8::Value> ToV8(v8::Isolate* isolate,
                                    content::NavigationEntry* entry) {
     if (!entry) {
       return v8::Null(isolate);
     }
-    gin_helper::Dictionary dict(isolate, v8::Object::New(isolate));
+    gin_helper::Dictionary dict = gin_helper::Dictionary::CreateEmpty(isolate);
     dict.Set("url", entry->GetURL().spec());
     dict.Set("title", entry->GetTitleForDisplay());
+
+    // Page state saves scroll position and values of any form fields
+    const blink::PageState& page_state = entry->GetPageState();
+    if (page_state.IsValid()) {
+      std::string encoded_data = base::Base64Encode(page_state.ToEncodedData());
+      dict.Set("pageState", encoded_data);
+    }
+
     return dict.GetHandle();
   }
 };
@@ -560,7 +617,7 @@ std::string RegisterFileSystem(content::WebContents* web_contents,
   content::ChildProcessSecurityPolicy* policy =
       content::ChildProcessSecurityPolicy::GetInstance();
   content::RenderViewHost* render_view_host = web_contents->GetRenderViewHost();
-  int renderer_id = render_view_host->GetProcess()->GetID();
+  int renderer_id = render_view_host->GetProcess()->GetDeprecatedID();
   policy->GrantReadFileSystem(renderer_id, file_system.id());
   policy->GrantWriteFileSystem(renderer_id, file_system.id());
   policy->GrantCreateFileForFileSystem(renderer_id, file_system.id());
@@ -1464,10 +1521,43 @@ void WebContents::RendererResponsive(
 
 bool WebContents::HandleContextMenu(content::RenderFrameHost& render_frame_host,
                                     const content::ContextMenuParams& params) {
-  Emit("context-menu", std::make_pair(params, &render_frame_host));
+#if BUILDFLAG(IS_WIN) && BUILDFLAG(ENABLE_BUILTIN_SPELLCHECKER)
+  if (!params.misspelled_word.empty() && spellcheck::UseBrowserSpellChecker()) {
+    SpellcheckService* spellcheck_service =
+        SpellcheckServiceFactory::GetForContext(
+            render_frame_host.GetBrowserContext());
+    if (spellcheck_service) {
+      spellcheck_platform::GetPerLanguageSuggestions(
+          spellcheck_service->platform_spell_checker(), params.misspelled_word,
+          base::BindOnce(&WebContents::OnGetPlatformSuggestionsComplete,
+                         GetWeakPtr(), std::ref(render_frame_host), params));
+    }
+  } else {
+#endif
+    Emit("context-menu",
+         std::make_tuple(params, &render_frame_host,
+                         std::optional<std::vector<std::u16string>>{}));
+#if BUILDFLAG(IS_WIN) && BUILDFLAG(ENABLE_BUILTIN_SPELLCHECKER)
+  }
+#endif
 
   return true;
 }
+
+#if BUILDFLAG(IS_WIN) && BUILDFLAG(ENABLE_BUILTIN_SPELLCHECKER)
+void WebContents::OnGetPlatformSuggestionsComplete(
+    content::RenderFrameHost& render_frame_host,
+    const content::ContextMenuParams& params,
+    const spellcheck::PerLanguageSuggestions&
+        platform_per_language_suggestions) {
+  std::vector<std::u16string> combined_suggestions;
+  spellcheck::FillSuggestions(platform_per_language_suggestions,
+                              &combined_suggestions);
+  Emit("context-menu",
+       std::make_tuple(params, &render_frame_host,
+                       std::make_optional(combined_suggestions)));
+}
+#endif
 
 void WebContents::FindReply(content::WebContents* web_contents,
                             int request_id,
@@ -1516,6 +1606,12 @@ void WebContents::RequestPointerLock(content::WebContents* web_contents,
 void WebContents::LostPointerLock() {
   exclusive_access_manager_.pointer_lock_controller()
       ->ExitExclusiveAccessToPreviousState();
+}
+
+bool WebContents::IsWaitingForPointerLockPrompt(
+    content::WebContents* web_contents) {
+  return exclusive_access_manager_.pointer_lock_controller()
+      ->IsWaitingForPointerLockPrompt(web_contents);
 }
 
 void WebContents::OnRequestKeyboardLock(content::WebContents* web_contents,
@@ -1740,7 +1836,8 @@ void WebContents::RenderViewDeleted(content::RenderViewHost* render_view_host) {
   // This event is necessary for tracking any states with respect to
   // intermediate render view hosts aka speculative render view hosts. Currently
   // used by object-registry.js to ref count remote objects.
-  Emit("render-view-deleted", render_view_host->GetProcess()->GetID());
+  Emit("render-view-deleted",
+       render_view_host->GetProcess()->GetID().GetUnsafeValue());
 
   if (web_contents()->GetRenderViewHost() == render_view_host) {
     // When the RVH that has been deleted is the current RVH it means that the
@@ -1748,7 +1845,7 @@ void WebContents::RenderViewDeleted(content::RenderViewHost* render_view_host) {
     // Currently tracked by guest-window-manager.ts to destroy the
     // BrowserWindow.
     Emit("current-render-view-deleted",
-         render_view_host->GetProcess()->GetID());
+         render_view_host->GetProcess()->GetID().GetUnsafeValue());
   }
 }
 
@@ -1820,7 +1917,8 @@ void WebContents::DOMContentLoaded(
 void WebContents::DidFinishLoad(content::RenderFrameHost* render_frame_host,
                                 const GURL& validated_url) {
   bool is_main_frame = !render_frame_host->GetParent();
-  int frame_process_id = render_frame_host->GetProcess()->GetID();
+  int32_t frame_process_id =
+      render_frame_host->GetProcess()->GetID().GetUnsafeValue();
   int frame_routing_id = render_frame_host->GetRoutingID();
   auto weak_this = GetWeakPtr();
   Emit("did-frame-finish-load", is_main_frame, frame_process_id,
@@ -1847,7 +1945,8 @@ void WebContents::DidFailLoad(content::RenderFrameHost* render_frame_host,
     return;
 
   bool is_main_frame = !render_frame_host->GetParent();
-  int frame_process_id = render_frame_host->GetProcess()->GetID();
+  int32_t frame_process_id =
+      render_frame_host->GetProcess()->GetID().GetUnsafeValue();
   int frame_routing_id = render_frame_host->GetRoutingID();
   Emit("did-fail-load", error_code, "", url, is_main_frame, frame_process_id,
        frame_routing_id);
@@ -1872,7 +1971,7 @@ bool WebContents::EmitNavigationEvent(
   int frame_process_id = -1, frame_routing_id = -1;
   content::RenderFrameHost* frame_host = GetRenderFrameHost(navigation_handle);
   if (frame_host) {
-    frame_process_id = frame_host->GetProcess()->GetID();
+    frame_process_id = frame_host->GetProcess()->GetID().GetUnsafeValue();
     frame_routing_id = frame_host->GetRoutingID();
   }
   bool is_same_document = navigation_handle->IsSameDocument();
@@ -1937,66 +2036,6 @@ void WebContents::OnFirstNonEmptyLayout(
   }
 }
 
-namespace {
-
-// This object wraps the InvokeCallback so that if it gets GC'd by V8, we can
-// still call the callback and send an error. Not doing so causes a Mojo DCHECK,
-// since Mojo requires callbacks to be called before they are destroyed.
-class ReplyChannel final : public gin::Wrappable<ReplyChannel> {
- public:
-  using InvokeCallback = electron::mojom::ElectronApiIPC::InvokeCallback;
-  static gin::Handle<ReplyChannel> Create(v8::Isolate* isolate,
-                                          InvokeCallback callback) {
-    return gin::CreateHandle(isolate, new ReplyChannel(std::move(callback)));
-  }
-
-  // gin::Wrappable
-  static gin::WrapperInfo kWrapperInfo;
-  gin::ObjectTemplateBuilder GetObjectTemplateBuilder(
-      v8::Isolate* isolate) override {
-    return gin::Wrappable<ReplyChannel>::GetObjectTemplateBuilder(isolate)
-        .SetMethod("sendReply", &ReplyChannel::SendReply);
-  }
-  const char* GetTypeName() override { return "ReplyChannel"; }
-
-  void SendError(const std::string& msg) {
-    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
-    // If there's no current context, it means we're shutting down, so we
-    // don't need to send an event.
-    if (!isolate->GetCurrentContext().IsEmpty()) {
-      v8::HandleScope scope(isolate);
-      auto message = gin::DataObjectBuilder(isolate).Set("error", msg).Build();
-      SendReply(isolate, message);
-    }
-  }
-
- private:
-  explicit ReplyChannel(InvokeCallback callback)
-      : callback_(std::move(callback)) {}
-  ~ReplyChannel() override {
-    if (callback_)
-      SendError("reply was never sent");
-  }
-
-  bool SendReply(v8::Isolate* isolate, v8::Local<v8::Value> arg) {
-    if (!callback_)
-      return false;
-    blink::CloneableMessage message;
-    if (!gin::ConvertFromV8(isolate, arg, &message)) {
-      return false;
-    }
-
-    std::move(callback_).Run(std::move(message));
-    return true;
-  }
-
-  InvokeCallback callback_;
-};
-
-gin::WrapperInfo ReplyChannel::kWrapperInfo = {gin::kEmbedderNativeGin};
-
-}  // namespace
-
 gin::Handle<gin_helper::internal::Event> WebContents::MakeEventWithSender(
     v8::Isolate* isolate,
     content::RenderFrameHost* frame,
@@ -2005,7 +2044,7 @@ gin::Handle<gin_helper::internal::Event> WebContents::MakeEventWithSender(
   if (!GetWrapper(isolate).ToLocal(&wrapper)) {
     if (callback) {
       // We must always invoke the callback if present.
-      ReplyChannel::Create(isolate, std::move(callback))
+      gin_helper::internal::ReplyChannel::Create(isolate, std::move(callback))
           ->SendError("WebContents was destroyed");
     }
     return {};
@@ -2013,13 +2052,14 @@ gin::Handle<gin_helper::internal::Event> WebContents::MakeEventWithSender(
   gin::Handle<gin_helper::internal::Event> event =
       gin_helper::internal::Event::New(isolate);
   gin_helper::Dictionary dict(isolate, event.ToV8().As<v8::Object>());
+  dict.Set("type", "frame");
   if (callback)
-    dict.Set("_replyChannel",
-             ReplyChannel::Create(isolate, std::move(callback)));
+    dict.Set("_replyChannel", gin_helper::internal::ReplyChannel::Create(
+                                  isolate, std::move(callback)));
   if (frame) {
     dict.SetGetter("senderFrame", frame);
     dict.Set("frameId", frame->GetRoutingID());
-    dict.Set("processId", frame->GetProcess()->GetID());
+    dict.Set("processId", frame->GetProcess()->GetID().GetUnsafeValue());
     dict.Set("frameTreeNodeId", frame->GetFrameTreeNodeId());
   }
   return event;
@@ -2121,7 +2161,7 @@ void WebContents::DidFinishNavigation(
       navigation_handle->GetRenderFrameHost();
   int frame_process_id = -1, frame_routing_id = -1;
   if (frame_host) {
-    frame_process_id = frame_host->GetProcess()->GetID();
+    frame_process_id = frame_host->GetProcess()->GetID().GetUnsafeValue();
     frame_routing_id = frame_host->GetRoutingID();
   }
   if (!navigation_handle->IsErrorPage()) {
@@ -2353,8 +2393,12 @@ void WebContents::SetBackgroundThrottling(bool allowed) {
   }
 }
 
-int WebContents::GetProcessID() const {
-  return web_contents()->GetPrimaryMainFrame()->GetProcess()->GetID();
+int32_t WebContents::GetProcessID() const {
+  return web_contents()
+      ->GetPrimaryMainFrame()
+      ->GetProcess()
+      ->GetID()
+      .GetUnsafeValue();
 }
 
 base::ProcessId WebContents::GetOSProcessID() const {
@@ -2581,6 +2625,47 @@ std::vector<content::NavigationEntry*> WebContents::GetHistory() const {
   return history;
 }
 
+void WebContents::RestoreHistory(
+    v8::Isolate* isolate,
+    gin_helper::ErrorThrower thrower,
+    int index,
+    const std::vector<v8::Local<v8::Value>>& entries) {
+  if (!web_contents()
+           ->GetController()
+           .GetLastCommittedEntry()
+           ->IsInitialEntry()) {
+    thrower.ThrowError(
+        "Cannot restore history on webContents that have previously loaded "
+        "a page.");
+    return;
+  }
+
+  auto navigation_entries = std::make_unique<
+      std::vector<std::unique_ptr<content::NavigationEntry>>>();
+
+  for (const auto& entry : entries) {
+    content::NavigationEntry* nav_entry = nullptr;
+    if (!gin::Converter<content::NavigationEntry*>::FromV8(isolate, entry,
+                                                           &nav_entry) ||
+        !nav_entry) {
+      // Invalid entry, bail out early
+      thrower.ThrowError(
+          "Failed to restore navigation history: Invalid navigation entry at "
+          "index " +
+          std::to_string(index) + ".");
+      return;
+    }
+    navigation_entries->push_back(
+        std::unique_ptr<content::NavigationEntry>(nav_entry));
+  }
+
+  if (!navigation_entries->empty()) {
+    web_contents()->GetController().Restore(
+        index, content::RestoreType::kRestored, navigation_entries.get());
+    web_contents()->GetController().LoadIfNecessary();
+  }
+}
+
 void WebContents::ClearHistory() {
   // In some rare cases (normally while there is no real history) we are in a
   // state where we can't prune navigation entries
@@ -2594,7 +2679,8 @@ int WebContents::GetHistoryLength() const {
 }
 
 const std::string WebContents::GetWebRTCIPHandlingPolicy() const {
-  return web_contents()->GetMutableRendererPrefs()->webrtc_ip_handling_policy;
+  return blink::ToString(
+      web_contents()->GetMutableRendererPrefs()->webrtc_ip_handling_policy);
 }
 
 void WebContents::SetWebRTCIPHandlingPolicy(
@@ -2602,7 +2688,7 @@ void WebContents::SetWebRTCIPHandlingPolicy(
   if (GetWebRTCIPHandlingPolicy() == webrtc_ip_handling_policy)
     return;
   web_contents()->GetMutableRendererPrefs()->webrtc_ip_handling_policy =
-      webrtc_ip_handling_policy;
+      blink::ToWebRTCIPHandlingPolicy(webrtc_ip_handling_policy);
 
   web_contents()->SyncRendererPrefs();
 }
@@ -2662,8 +2748,9 @@ std::string WebContents::GetMediaSourceID(
   content::DesktopMediaID media_id(
       content::DesktopMediaID::TYPE_WEB_CONTENTS,
       content::DesktopMediaID::kNullId,
-      content::WebContentsMediaCaptureId(frame_host->GetProcess()->GetID(),
-                                         frame_host->GetRoutingID()));
+      content::WebContentsMediaCaptureId(
+          frame_host->GetProcess()->GetDeprecatedID(),
+          frame_host->GetRoutingID()));
 
   auto* request_frame_host = request_web_contents->GetPrimaryMainFrame();
   if (!request_frame_host)
@@ -2671,7 +2758,7 @@ std::string WebContents::GetMediaSourceID(
 
   std::string id =
       content::DesktopStreamsRegistry::GetInstance()->RegisterStream(
-          request_frame_host->GetProcess()->GetID(),
+          request_frame_host->GetProcess()->GetDeprecatedID(),
           request_frame_host->GetRoutingID(),
           url::Origin::Create(request_frame_host->GetLastCommittedURL()
                                   .DeprecatedGetOriginAsURL()),
@@ -3700,22 +3787,15 @@ void WebContents::SetTemporaryZoomLevel(double level) {
   zoom_controller_->SetTemporaryZoomLevel(level);
 }
 
-void WebContents::DoGetZoomLevel(
-    electron::mojom::ElectronWebContentsUtility::DoGetZoomLevelCallback
-        callback) {
-  std::move(callback).Run(GetZoomLevel());
-}
-
-std::vector<base::FilePath> WebContents::GetPreloadPaths() const {
-  auto result = SessionPreferences::GetValidPreloads(GetBrowserContext());
-
+std::optional<PreloadScript> WebContents::GetPreloadScript() const {
   if (auto* web_preferences = WebContentsPreferences::From(web_contents())) {
     if (auto preload = web_preferences->GetPreloadPath()) {
-      result.emplace_back(*preload);
+      auto preload_script = PreloadScript{
+          "", PreloadScript::ScriptType::kWebFrame, preload.value()};
+      return preload_script;
     }
   }
-
-  return result;
+  return std::nullopt;
 }
 
 v8::Local<v8::Value> WebContents::GetLastWebPreferences(
@@ -4411,6 +4491,7 @@ void WebContents::FillObjectTemplate(v8::Isolate* isolate,
                  &WebContents::RemoveNavigationEntryAtIndex)
       .SetMethod("_getHistory", &WebContents::GetHistory)
       .SetMethod("_clearHistory", &WebContents::ClearHistory)
+      .SetMethod("_restoreHistory", &WebContents::RestoreHistory)
       .SetMethod("isCrashed", &WebContents::IsCrashed)
       .SetMethod("forcefullyCrashRenderer",
                  &WebContents::ForcefullyCrashRenderer)
@@ -4469,7 +4550,7 @@ void WebContents::FillObjectTemplate(v8::Isolate* isolate,
       .SetMethod("setZoomFactor", &WebContents::SetZoomFactor)
       .SetMethod("getZoomFactor", &WebContents::GetZoomFactor)
       .SetMethod("getType", &WebContents::type)
-      .SetMethod("_getPreloadPaths", &WebContents::GetPreloadPaths)
+      .SetMethod("_getPreloadScript", &WebContents::GetPreloadScript)
       .SetMethod("getLastWebPreferences", &WebContents::GetLastWebPreferences)
       .SetMethod("getOwnerBrowserWindow", &WebContents::GetOwnerBrowserWindow)
       .SetMethod("inspectServiceWorker", &WebContents::InspectServiceWorker)
@@ -4517,6 +4598,10 @@ void WebContents::FillObjectTemplate(v8::Isolate* isolate,
 
 const char* WebContents::GetTypeName() {
   return GetClassName();
+}
+
+void WebContents::WillBeDestroyed() {
+  ClearWeak();
 }
 
 ElectronBrowserContext* WebContents::GetBrowserContext() const {
